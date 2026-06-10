@@ -30,3 +30,8 @@ Reads `devWalletFunding` directly from Axiom's React component tree — the same
 ## Supported exchanges
 
 Binance, Coinbase, OKX, Bybit, Kraken, Kucoin, Upbit, MEXC, Robinhood, Moonpay, Phantom, Revolut, Wintermute, Crypto.com, Bitstamp, Blockchain.com, Whitebit, WOO, and 80+ more.
+
+---
+
+❤️ If this extension is useful to you, you can say thanks with a SOL donation:
+`7qmeYezpVaYpnaq6t9D4XH3Q9AYSuF264p66MbHX3ERt`
