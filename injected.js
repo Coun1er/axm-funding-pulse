@@ -32,8 +32,9 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  // ── Exchange wallet → name map ───────────────────────────────────────────
-  const SOL_FUNDING_MAP = {
+  // ── Exchange wallet → name map (loaded dynamically from Axiom's bundle) ──
+  // Fallback hardcoded map used if dynamic loading fails
+  const FALLBACK_MAP = {
     "5Xm6nU1Bi6UewCrhJQFk1CAV97ZJaRiFw4tFNhUbXy3u": "Alameda Research",
     "8SiWXTpcTUovS2LxCvxcPdTnS5f5CCYjzmNRmB1JVEJo": "Alameda Research",
     "7DyZQw3iV5zhHssnNA6Nopi5zc8NGLbYjHMcaok6NN66": "Allbridge",
@@ -139,6 +140,51 @@
     "6H56d5EH5kWYHyTcRz7Skb1VbBQuQ6k5gwkQwFSLSJCE": "WOO",
     "41uCv6a1JPwZT4pDAN4AGvPosHVx2ndkNFEFgKLzd5wx": "XT.com",
   };
+
+  let SOL_FUNDING_MAP = FALLBACK_MAP;
+
+  // Probe address always present in Axiom's funding map chunk
+  const MAP_PROBE = "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9";
+  const MAP_CACHE_KEY = "axf_map_v1";
+
+  async function loadFundingMap() {
+    try {
+      const cached = sessionStorage.getItem(MAP_CACHE_KEY);
+      if (cached) { SOL_FUNDING_MAP = JSON.parse(cached); return; }
+    } catch {}
+
+    const urls = performance.getEntriesByType("resource")
+      .filter(r => r.name.includes("axiom.trade") && r.name.includes(".js"))
+      .map(r => r.name);
+
+    for (const url of urls) {
+      try {
+        const text = await fetch(url).then(r => r.text());
+        if (!text.includes(MAP_PROBE)) continue;
+
+        const idx = text.indexOf(MAP_PROBE);
+        let start = idx;
+        while (start > 0 && text[start] !== "{") start--;
+        let depth = 0, end = start;
+        while (end < text.length) {
+          if (text[end] === "{") depth++;
+          else if (text[end] === "}") { depth--; if (depth === 0) break; }
+          end++;
+        }
+        const slice = text.substring(start, end + 1);
+        const re = /"?([A-HJ-NP-Za-km-z1-9]{32,44})"?\s*:\s*"([^"]+)"/g;
+        const map = {};
+        let m;
+        while ((m = re.exec(slice)) !== null) map[m[1]] = m[2];
+
+        if (Object.keys(map).length > 50) {
+          SOL_FUNDING_MAP = map;
+          try { sessionStorage.setItem(MAP_CACHE_KEY, JSON.stringify(map)); } catch {}
+          return;
+        }
+      } catch {}
+    }
+  }
 
   // ── Helpers ──────────────────────────────────────────────────────────────
   function getExchangeIconUrl(name) {
@@ -283,5 +329,8 @@
   // Periodic re-scan to catch React re-renders
   setInterval(scan, 1500);
 
+  // Load Axiom's live funding map, then scan
+  // Scan once immediately with fallback map, then re-scan after map loads
   scan();
+  loadFundingMap().then(() => scan());
 })();
