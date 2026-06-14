@@ -24,7 +24,6 @@
         flex-shrink: 0;
       }
       .axf-badge-tracker {
-        color: #7dd3fc;
         border-color: rgba(125,211,252,0.25);
         background: rgba(125,211,252,0.06);
       }
@@ -147,6 +146,25 @@
   const MAP_PROBE = "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9";
   const MAP_CACHE_KEY = "axf_map_v1";
 
+  // ── Resolved label cache (mirrors Axiom's own funding tooltip) ──────────
+  // Populated lazily by briefly opening Axiom's native tooltip in the
+  // background (see resolveViaHover) since exchange names and Wallet
+  // Tracker labels aren't available in any static/local data source.
+  const RESOLVED_CACHE_KEY = "axf_resolved_v3";
+  const resolvedLabelCache = new Map();
+  try {
+    const cached = JSON.parse(sessionStorage.getItem(RESOLVED_CACHE_KEY) || "{}");
+    for (const [addr, val] of Object.entries(cached)) resolvedLabelCache.set(addr, val);
+  } catch {}
+
+  function persistResolvedCache() {
+    try {
+      const obj = {};
+      for (const [addr, val] of resolvedLabelCache) obj[addr] = val;
+      sessionStorage.setItem(RESOLVED_CACHE_KEY, JSON.stringify(obj));
+    } catch {}
+  }
+
   async function loadFundingMap() {
     try {
       const cached = sessionStorage.getItem(MAP_CACHE_KEY);
@@ -194,6 +212,16 @@
 
   function getFundingLabel(addr) {
     if (!addr) return null;
+    const resolved = resolvedLabelCache.get(addr);
+    if (resolved && resolved.label) {
+      return {
+        label: resolved.label,
+        isTracker: resolved.isTracker,
+        iconUrl: resolved.isTracker ? null : getExchangeIconUrl(resolved.label),
+        iconEmoji: resolved.icon || null,
+        color: resolved.color || null,
+      };
+    }
     try {
       const trackers = JSON.parse(localStorage.getItem("allSolWallets") || "[]");
       const t = trackers.find(w => w.walletAddress === addr);
@@ -230,6 +258,167 @@
     return null;
   }
 
+  // ── Lazy label resolution via Axiom's own (briefly hidden) tooltip ───────
+  // Axiom resolves exchange names and Wallet Tracker labels lazily on hover.
+  // To surface that without requiring the user to hover, we briefly trigger
+  // the same hover programmatically, hide the resulting tooltip before it
+  // can paint, read the resolved label from its text, then close it again.
+  const resolveQueue = [];
+  const pendingResolve = new Set();
+  let resolving = false;
+  const EMOJI_LABEL_RE = /^(\p{Extended_Pictographic}️?)\s*(.+)$/u;
+  // Matches a raw (possibly truncated) Solana address, e.g. "9zQVmMxP4Dgq...vHs5"
+  // or "9zQVmMxP4Dgq…vHs5" (Axiom truncates with a real ellipsis char too),
+  // or a full base58 address - shown by Axiom when it has no friendly name for it.
+  const ADDRESS_LIKE_RE = /\.\.\.|…|^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+  // How long a "no friendly label" result stays cached before being re-checked,
+  // so newly-added Wallet Tracker entries get picked up without a page reload.
+  const NO_LABEL_TTL_MS = 60 * 1000;
+
+  function enqueueResolve(address, pill) {
+    if (!address || pendingResolve.has(address)) return;
+    const cached = resolvedLabelCache.get(address);
+    if (cached && (cached.label || Date.now() - cached.ts < NO_LABEL_TTL_MS)) return;
+    pendingResolve.add(address);
+    resolveQueue.push({ address, pill });
+    processResolveQueue();
+  }
+
+  async function processResolveQueue() {
+    if (resolving) return;
+    resolving = true;
+    while (resolveQueue.length) {
+      const { address, pill } = resolveQueue.shift();
+      try {
+        const result = await resolveViaHover(pill);
+        if (result !== undefined) {
+          resolvedLabelCache.set(address, result);
+          persistResolvedCache();
+          scheduleScan();
+        }
+      } catch {}
+      pendingResolve.delete(address);
+      await new Promise(r => setTimeout(r, 200));
+    }
+    resolving = false;
+  }
+
+  // Parses a "Funded" tooltip into a resolved-label result, including the
+  // per-wallet color Axiom rendered the label/emoji in (if any).
+  function parseFundingTooltip(tip) {
+    const entries = [];
+    const walker = document.createTreeWalker(tip, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      const t = n.textContent.trim();
+      if (t) entries.push({ t, node: n });
+    }
+    const idx = entries.findIndex(e => e.t === "Funded");
+    if (idx < 0) return undefined;
+    const extraEntries = entries.slice(idx + 1).filter(e => e.t !== "Paid");
+    const extra = extraEntries.map(e => e.t).join(" ").trim();
+    if (extra && !ADDRESS_LIKE_RE.test(extra)) {
+      const m = extra.match(EMOJI_LABEL_RE);
+      // Pick the node whose text contains the label portion to read its
+      // color from - this is the per-wallet color Axiom assigns in its
+      // own tooltip (e.g. Wallet Tracker entries can have custom colors).
+      let colorNode = m ? extraEntries.find(e => e.t.includes(m[2]))?.node : null;
+      if (!colorNode) colorNode = extraEntries[extraEntries.length - 1]?.node;
+      const color = colorNode ? getComputedStyle(colorNode.parentElement).color : null;
+      return m
+        ? { label: m[2], isTracker: true, icon: m[1], color }
+        : { label: extra, isTracker: false, icon: null, color };
+    }
+    return { label: null, ts: Date.now() };
+  }
+
+  async function resolveViaHover(pill) {
+    if (!pill || !pill.isConnected) return undefined;
+    const rect = pill.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return undefined;
+
+    const opts = {
+      bubbles: true, cancelable: true, view: window,
+      clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2,
+    };
+
+    const added = [];
+    const obs = new MutationObserver(muts => {
+      for (const m of muts) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType === 1 && typeof node.className === "string" && node.className.includes("fixed")) {
+            try { node.style.opacity = "0"; node.style.pointerEvents = "none"; } catch {}
+            added.push(node);
+          }
+        }
+      }
+    });
+    obs.observe(document.body, { childList: true });
+
+    pill.dispatchEvent(new PointerEvent("pointerover", opts));
+    pill.dispatchEvent(new MouseEvent("mouseover", opts));
+    pill.dispatchEvent(new PointerEvent("pointerenter", opts));
+    pill.dispatchEvent(new MouseEvent("mouseenter", opts));
+    pill.dispatchEvent(new MouseEvent("mousemove", opts));
+
+    let result;
+    for (let i = 0; i < 14; i++) {
+      await new Promise(r => setTimeout(r, 50));
+      const tip = added.find(el => el.textContent.includes("Funded"));
+      if (tip) {
+        result = parseFundingTooltip(tip);
+        break;
+      }
+    }
+
+    obs.disconnect();
+    pill.dispatchEvent(new MouseEvent("mouseleave", opts));
+    pill.dispatchEvent(new PointerEvent("pointerleave", opts));
+    pill.dispatchEvent(new MouseEvent("mouseout", opts));
+    pill.dispatchEvent(new PointerEvent("pointerout", opts));
+
+    return result;
+  }
+
+  // ── Passive learning from the user's own hovers ──────────────────────────
+  // If the user hovers a funding pill themselves, Axiom's tooltip already
+  // shows the resolved label/color - capture it directly so the badge
+  // updates immediately, without waiting on the background queue/TTL.
+  let hoveredPill = null;
+  document.addEventListener("pointerover", e => {
+    let el = e.target;
+    hoveredPill = null;
+    for (let i = 0; i < 8 && el; i++) {
+      if (typeof el.className === "string" && el.className.includes("rounded-full") &&
+          el.nextElementSibling?.classList?.contains("axf-badge")) {
+        hoveredPill = el;
+        break;
+      }
+      el = el.parentElement;
+    }
+  }, true);
+
+  new MutationObserver(muts => {
+    if (!hoveredPill || !hoveredPill.isConnected) return;
+    for (const m of muts) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType !== 1 || typeof node.className !== "string") continue;
+        if (!node.className.includes("fixed") || !node.textContent.includes("Funded")) continue;
+        const chef = hoveredPill.querySelector("i.icon-chef-hat");
+        const funding = chef && getDevFundingFromFiber(chef);
+        const addr = funding?.fundingWalletAddress;
+        if (!addr) return;
+        const parsed = parseFundingTooltip(node);
+        if (parsed !== undefined) {
+          resolvedLabelCache.set(addr, parsed);
+          persistResolvedCache();
+          scheduleScan();
+        }
+        return;
+      }
+    }
+  }).observe(document.body, { childList: true });
+
   // ── Badge renderer ───────────────────────────────────────────────────────
   function updateBadgeForChef(chefEl) {
     const funding = getDevFundingFromFiber(chefEl);
@@ -251,6 +440,8 @@
     const age = formatFundingAge(funding.fundedAt);
     const labelInfo = getFundingLabel(funding.fundingWalletAddress);
 
+    if (funding.fundingWalletAddress) enqueueResolve(funding.fundingWalletAddress, pill);
+
     if (!amountSol && !age && !labelInfo) {
       if (isMine) badge.remove();
       return;
@@ -267,7 +458,7 @@
     if (labelInfo?.isTracker) badge.classList.add("axf-badge-tracker");
     else badge.classList.remove("axf-badge-tracker");
 
-    const contentKey = `${amountSol}|${age}|${labelInfo?.label}`;
+    const contentKey = `${amountSol}|${age}|${labelInfo?.label}|${labelInfo?.iconEmoji}|${labelInfo?.color}`;
     if (badge.dataset.ck === contentKey) return;
     badge.dataset.ck = contentKey;
     badge.textContent = "";
@@ -282,17 +473,23 @@
     // Age
     if (age) badge.appendChild(document.createTextNode(` · ${age}`));
 
-    // Exchange icon + name
+    // Exchange icon / tracker emoji + name
     if (labelInfo) {
       badge.appendChild(document.createTextNode(" · "));
-      if (labelInfo.iconUrl) {
+      const labelSpan = document.createElement("span");
+      labelSpan.style.cssText = "display:inline-flex;align-items:center;";
+      if (labelInfo.color) labelSpan.style.color = labelInfo.color;
+      if (labelInfo.iconEmoji) {
+        labelSpan.appendChild(document.createTextNode(`${labelInfo.iconEmoji} `));
+      } else if (labelInfo.iconUrl) {
         const img = document.createElement("img");
         img.src = labelInfo.iconUrl;
         img.style.cssText = "width:12px;height:12px;border-radius:2px;vertical-align:middle;margin-right:2px;flex-shrink:0;";
         img.onerror = () => img.remove();
-        badge.appendChild(img);
+        labelSpan.appendChild(img);
       }
-      badge.appendChild(document.createTextNode(labelInfo.label));
+      labelSpan.appendChild(document.createTextNode(labelInfo.label));
+      badge.appendChild(labelSpan);
     }
   }
 
